@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.1] - 2026-08-22
+
+### Fixed
+
+- Added headless LibreOffice and Office-compatible fonts to the default Docker image so agents can convert Word, Excel, and PowerPoint files to PDF without installing extra system packages. The slim, alpine, and openshift images remain minimal.
+
 ## [0.12.0] - 2026-08-22
 
 ### Added

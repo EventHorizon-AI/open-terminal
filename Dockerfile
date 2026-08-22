@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq xmlstarlet sqlite3 \
     # Media & documents
     ffmpeg pandoc imagemagick texlive-latex-base \
+    libreoffice-nogui fonts-dejavu fonts-crosextra-caladea fonts-crosextra-carlito \
     # Compression
     zip unzip tar gzip bzip2 xz-utils zstd p7zip-full \
     # System
