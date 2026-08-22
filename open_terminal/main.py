@@ -29,6 +29,10 @@ from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_O
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner
 from open_terminal.utils.fs import UserFS
 
+MATCH_PAGE_SIZE = 100
+MAX_CONTENT_MATCHES_PER_FILE = 3
+MAX_CONTENT_SEARCH_FILE_SIZE = 1 * 1024 * 1024
+
 if MULTI_USER:
     from open_terminal.utils.user_isolation import check_environment, resolve_user
     check_environment()
@@ -905,6 +909,234 @@ async def grep_search(
         "matches": matches,
         "truncated": truncated,
     }
+
+
+@app.get(
+    "/files/matches",
+    operation_id="match_files",
+    summary="Search files by name and contents",
+    description="Search files and directories by ranked name, path, and content matches.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        400: {"description": "Blank query."},
+        404: {"description": "Search directory not found."},
+        401: {"description": "Invalid or missing API key."},
+    },
+)
+async def match_files(
+    http_request: Request,
+    query: str = Query(..., description="Literal text to match."),
+    path: str = Query(".", description="Directory to search within."),
+    show_hidden: bool = Query(False, description="Include hidden dotfiles and dot-directories."),
+    offset: int = Query(0, description="Result offset.", ge=0),
+    limit: int = Query(
+        MATCH_PAGE_SIZE,
+        description="Maximum number of results to return.",
+        ge=1,
+        le=MATCH_PAGE_SIZE,
+    ),
+    fs: UserFS = Depends(get_filesystem),
+):
+    query = query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query must not be blank")
+
+    session_id = http_request.headers.get("x-session-id")
+    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    target = fs.resolve_path(path, cwd=session_cwd)
+    if not fs.is_path_allowed(target) or not await aiofiles.os.path.isdir(target):
+        raise HTTPException(status_code=404, detail="Search directory not found")
+
+    def _matches_sync():
+        query_lower = query.lower()
+
+        def is_hidden_path(candidate: str) -> bool:
+            return any(part.startswith(".") for part in candidate.replace("\\", "/").split("/") if part)
+
+        def content_match(text: str, line: int) -> dict | None:
+            text = text.rstrip("\r\n")
+            index = text.lower().find(query_lower)
+            if index < 0:
+                return None
+            column = len(text[:index].encode("utf-16-le")) // 2 + 1
+            return {"line": line, "column": column, "text": text}
+
+        def walk_entries() -> list[tuple[str, str]]:
+            try:
+                git_result = subprocess.run(
+                    ["git", "-C", target, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
+                    check=False,
+                    capture_output=True,
+                )
+            except OSError:
+                git_result = None
+
+            if git_result and git_result.returncode == 0:
+                git_entries = []
+                seen = set()
+                for raw in git_result.stdout.split(b"\0"):
+                    if not raw:
+                        continue
+                    rel_path = os.fsdecode(raw)
+                    if not show_hidden and is_hidden_path(rel_path):
+                        continue
+                    full_path = os.path.normpath(os.path.join(target, rel_path))
+                    if not fs.is_path_allowed(full_path):
+                        continue
+                    parent_rel = os.path.dirname(rel_path)
+                    while parent_rel and parent_rel != ".":
+                        if show_hidden or not is_hidden_path(parent_rel):
+                            directory = os.path.normpath(os.path.join(target, parent_rel))
+                            if directory not in seen and fs.is_path_allowed(directory):
+                                seen.add(directory)
+                                git_entries.append((directory, "directory"))
+                        parent_rel = os.path.dirname(parent_rel)
+                    if full_path not in seen:
+                        seen.add(full_path)
+                        git_entries.append((full_path, "directory" if os.path.isdir(full_path) else "file"))
+                return sorted(git_entries, key=lambda item: os.path.relpath(item[0], target).lower())
+
+            entries = []
+            for dirpath, dirnames, filenames in os.walk(target):
+                dirnames[:] = [
+                    d
+                    for d in sorted(dirnames)
+                    if (show_hidden or not d.startswith("."))
+                    and fs.is_path_allowed(os.path.join(dirpath, d))
+                ]
+                for name in dirnames:
+                    entries.append((os.path.join(dirpath, name), "directory"))
+                for name in sorted(filenames):
+                    if show_hidden or not name.startswith("."):
+                        full_path = os.path.join(dirpath, name)
+                        if fs.is_path_allowed(full_path):
+                            entries.append((full_path, "file"))
+            return entries
+
+        def content_matches_with_rg(files: set[str]) -> dict[str, list[dict]] | None:
+            rg = shutil.which("rg")
+            if not rg:
+                return None
+            args = [
+                rg,
+                "--json",
+                "--no-messages",
+                "--fixed-strings",
+                "--ignore-case",
+                "--line-number",
+                "--column",
+                "--max-count",
+                str(MAX_CONTENT_MATCHES_PER_FILE + 1),
+            ]
+            if show_hidden:
+                args.append("--hidden")
+            args.extend(("--", query, target))
+            try:
+                completed = subprocess.run(args, capture_output=True, text=True, check=False)
+            except OSError:
+                return None
+            if completed.returncode not in (0, 1):
+                return None
+
+            matches: dict[str, list[dict]] = {}
+            for raw in completed.stdout.splitlines():
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if message.get("type") != "match":
+                    continue
+                data = message["data"]
+                path = os.path.normpath(data["path"]["text"])
+                if path not in files:
+                    continue
+                line_matches = matches.setdefault(path, [])
+                if len(line_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
+                    continue
+                match = content_match(data["lines"]["text"], data["line_number"])
+                if match:
+                    line_matches.append(match)
+            return matches
+
+        def content_matches_with_python(files: set[str]) -> dict[str, list[dict]]:
+            matches: dict[str, list[dict]] = {}
+            for file_path in files:
+                try:
+                    if os.path.getsize(file_path) > MAX_CONTENT_SEARCH_FILE_SIZE:
+                        continue
+                    with open(file_path, "rb") as source:
+                        if b"\0" in source.read(8192):
+                            continue
+                    with open(file_path, "r", encoding="utf-8", errors="replace") as source:
+                        lines = source.read().splitlines()
+                except OSError:
+                    continue
+
+                for number, text in enumerate(lines, start=1):
+                    match = content_match(text, number)
+                    if not match:
+                        continue
+                    file_matches = matches.setdefault(file_path, [])
+                    if len(file_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
+                        break
+                    file_matches.append(match)
+            return matches
+
+        entries = walk_entries()
+        files = {
+            os.path.normpath(entry_path)
+            for entry_path, entry_type in entries
+            if entry_type == "file" and not os.path.islink(entry_path)
+        }
+        content_matches = content_matches_with_rg(files)
+        if content_matches is None:
+            content_matches = content_matches_with_python(files)
+
+        matches = []
+        for entry_path, entry_type in entries:
+            rel_path = os.path.relpath(entry_path, target).replace("\\", "/")
+            name = os.path.basename(entry_path)
+            name_lower = name.lower()
+            rel_lower = rel_path.lower()
+            if name_lower == query_lower:
+                score = 0
+            elif name_lower.startswith(query_lower):
+                score = 1
+            elif query_lower in name_lower:
+                score = 2
+            elif query_lower in rel_lower:
+                score = 3
+            else:
+                score = 4
+
+            entry_content_matches = content_matches.get(os.path.normpath(entry_path), []) if entry_type == "file" else []
+            name_match = score < 4
+            if not name_match and not entry_content_matches:
+                continue
+            matches.append(
+                (
+                    score,
+                    len(rel_path),
+                    rel_lower,
+                    {
+                        "path": entry_path,
+                        "relative_path": rel_path,
+                        "name": name,
+                        "type": entry_type,
+                        "name_match": name_match,
+                        "content_matches": entry_content_matches,
+                    },
+                )
+            )
+
+        matches.sort(key=lambda item: (item[0], item[1], item[2]))
+        next_offset = offset + limit if offset + limit < len(matches) else None
+        return {
+            "results": [item[3] for item in matches[offset : offset + limit]],
+            "next_offset": next_offset,
+        }
+
+    return await asyncio.to_thread(_matches_sync)
 
 
 @app.get(
