@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.0] - 2026-08-22
+
+### Added
+
+- Apps can now search terminal workspace files by file name and file contents in one file browser search.
+- Search results show file name matches first, followed by files that match inside their contents.
+- Content results include matching line previews so users can jump to the relevant place in a file.
+- File browser search follows the current terminal session folder, so users search the same workspace their terminal is using.
+- File browser search respects `.gitignore` and the app's hidden-file setting.
+- Large search result sets can now load more results without restarting the search.
+
 ## [0.11.36] - 2026-08-22
 
 ### Added
