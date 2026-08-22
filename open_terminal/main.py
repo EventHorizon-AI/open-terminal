@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import time
 import uuid
@@ -44,7 +45,6 @@ try:
     import fcntl
     import pty
     import struct
-    import subprocess
     import termios
 
     _PTY_AVAILABLE = True
@@ -448,7 +448,6 @@ if OPEN_TERMINAL_INFO:
 # ---------------------------------------------------------------------------
 # Files
 # ---------------------------------------------------------------------------
-
 
 @app.get(
     "/files/cwd",
@@ -906,6 +905,137 @@ async def grep_search(
         "matches": matches,
         "truncated": truncated,
     }
+
+
+@app.get(
+    "/files/search",
+    operation_id="search_files",
+    summary="Search files by name",
+    description="Search for files and subdirectories by ranked filename match.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        404: {"description": "Search directory not found."},
+        401: {"description": "Invalid or missing API key."},
+    },
+)
+async def search_files(
+    http_request: Request,
+    query: str = Query("", description="Filename search term."),
+    path: str = Query(".", description="Directory to search within."),
+    limit: int = Query(20, description="Maximum number of matches to return.", ge=1, le=100),
+    type: Optional[str] = Query(
+        "any",
+        description="Type filter: 'file', 'directory', or 'any'.",
+        pattern="^(file|directory|any)$",
+    ),
+    fs: UserFS = Depends(get_filesystem),
+):
+    session_id = http_request.headers.get("x-session-id")
+    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    target = fs.resolve_path(path, cwd=session_cwd)
+    if not fs.is_path_allowed(target) or not await aiofiles.os.path.isdir(target):
+        raise HTTPException(status_code=404, detail="Search directory not found")
+
+    def _search_sync():
+        query_lower = query.strip().lower()
+        candidates = []
+        seen = set()
+
+        try:
+            git_result = subprocess.run(
+                ["git", "-C", target, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
+                check=False,
+                capture_output=True,
+            )
+        except OSError:
+            git_result = None
+
+        if git_result and git_result.returncode == 0:
+            for raw in git_result.stdout.split(b"\0"):
+                if not raw:
+                    continue
+                rel_path = os.fsdecode(raw)
+                parts = rel_path.replace("\\", "/").split("/")
+                if any(part.startswith(".") for part in parts):
+                    continue
+
+                full_path = os.path.normpath(os.path.join(target, rel_path))
+                if type in ("any", "file") and full_path not in seen:
+                    seen.add(full_path)
+                    candidates.append((full_path, "file"))
+
+                if type in ("any", "directory"):
+                    parent_rel = os.path.dirname(rel_path)
+                    while parent_rel and parent_rel != ".":
+                        if not any(part.startswith(".") for part in parent_rel.replace("\\", "/").split("/")):
+                            directory = os.path.normpath(os.path.join(target, parent_rel))
+                            if directory not in seen:
+                                seen.add(directory)
+                                candidates.append((directory, "directory"))
+                        parent_rel = os.path.dirname(parent_rel)
+        else:
+            for dirpath, dirnames, filenames in os.walk(target):
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if not d.startswith(".")
+                    and fs.is_path_allowed(os.path.join(dirpath, d))
+                ]
+
+                if type in ("any", "directory"):
+                    for name in dirnames:
+                        full_path = os.path.join(dirpath, name)
+                        if full_path not in seen:
+                            seen.add(full_path)
+                            candidates.append((full_path, "directory"))
+
+                if type in ("any", "file"):
+                    for name in filenames:
+                        if name.startswith("."):
+                            continue
+                        full_path = os.path.join(dirpath, name)
+                        if full_path not in seen:
+                            seen.add(full_path)
+                            candidates.append((full_path, "file"))
+
+        matches = []
+        for full_path, entry_type in candidates:
+            if not fs.is_path_allowed(full_path):
+                continue
+
+            name = os.path.basename(full_path)
+            name_lower = name.lower()
+            if query_lower and query_lower in name_lower:
+                rank = 0 if name_lower == query_lower else 1 if name_lower.startswith(query_lower) else 2
+            elif not query_lower:
+                rank = 2
+            else:
+                continue
+
+            try:
+                file_stat = os.stat(full_path)
+            except OSError:
+                continue
+
+            matches.append(
+                (
+                    rank,
+                    len(name),
+                    os.path.relpath(full_path, target).lower(),
+                    {
+                        "path": full_path,
+                        "name": name,
+                        "type": entry_type,
+                        "size": file_stat.st_size,
+                        "modified": file_stat.st_mtime,
+                    },
+                )
+            )
+
+        matches.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [item[3] for item in matches[:limit]]
+
+    return {"results": await asyncio.to_thread(_search_sync)}
 
 
 @app.get(
