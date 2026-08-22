@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.36] - 2026-08-22
+
+### Added
+
+- Added file search for apps that need to let users pick files from the active terminal workspace.
+- File search now follows the current terminal session folder, so results come from the same place the terminal is working in.
+- File search respects `.gitignore`, so ignored folders and files do not appear in picker results.
+- File search can include hidden dotfiles when the connected app asks to show them.
+
+### Fixed
+
+- Every file search result now includes the file name, full path, whether it is a file or folder, file size, and last modified time.
+
 ## [0.11.35] - 2026-08-09
 
 ### Added
