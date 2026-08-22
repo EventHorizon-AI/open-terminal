@@ -928,6 +928,7 @@ async def search_files(
         description="Type filter: 'file', 'directory', or 'any'.",
         pattern="^(file|directory|any)$",
     ),
+    show_hidden: bool = Query(False, description="Include hidden dotfiles and dot-directories."),
     fs: UserFS = Depends(get_filesystem),
 ):
     session_id = http_request.headers.get("x-session-id")
@@ -956,7 +957,7 @@ async def search_files(
                     continue
                 rel_path = os.fsdecode(raw)
                 parts = rel_path.replace("\\", "/").split("/")
-                if any(part.startswith(".") for part in parts):
+                if not show_hidden and any(part.startswith(".") for part in parts):
                     continue
 
                 full_path = os.path.normpath(os.path.join(target, rel_path))
@@ -967,7 +968,9 @@ async def search_files(
                 if type in ("any", "directory"):
                     parent_rel = os.path.dirname(rel_path)
                     while parent_rel and parent_rel != ".":
-                        if not any(part.startswith(".") for part in parent_rel.replace("\\", "/").split("/")):
+                        if show_hidden or not any(
+                            part.startswith(".") for part in parent_rel.replace("\\", "/").split("/")
+                        ):
                             directory = os.path.normpath(os.path.join(target, parent_rel))
                             if directory not in seen:
                                 seen.add(directory)
@@ -978,7 +981,7 @@ async def search_files(
                 dirnames[:] = [
                     d
                     for d in dirnames
-                    if not d.startswith(".")
+                    if (show_hidden or not d.startswith("."))
                     and fs.is_path_allowed(os.path.join(dirpath, d))
                 ]
 
@@ -991,7 +994,7 @@ async def search_files(
 
                 if type in ("any", "file"):
                     for name in filenames:
-                        if name.startswith("."):
+                        if not show_hidden and name.startswith("."):
                             continue
                         full_path = os.path.join(dirpath, name)
                         if full_path not in seen:
