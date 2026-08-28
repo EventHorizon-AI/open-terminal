@@ -3,6 +3,8 @@ import hmac
 from importlib.metadata import version as _pkg_version
 import fnmatch
 import json
+import logging
+import tempfile
 
 import aiofiles
 import aiofiles.os
@@ -12,6 +14,7 @@ import re
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import time
 import uuid
@@ -27,6 +30,11 @@ from pydantic import BaseModel, Field
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner
 from open_terminal.utils.fs import UserFS
+
+MATCH_PAGE_SIZE = 100
+MAX_CONTENT_MATCHES_PER_FILE = 3
+MAX_CONTENT_SEARCH_FILE_SIZE = 1 * 1024 * 1024
+log = logging.getLogger(__name__)
 
 if MULTI_USER:
     from open_terminal.utils.user_isolation import check_environment, resolve_user
@@ -44,7 +52,6 @@ try:
     import fcntl
     import pty
     import struct
-    import subprocess
     import termios
 
     _PTY_AVAILABLE = True
@@ -163,6 +170,37 @@ def get_file_browser_root(fs: UserFS) -> dict[str, str] | None:
     root_path = fs.resolve_path(path)
     label = "Home" if root_path == fs.home else os.path.basename(root_path) or root_path
     return {"path": root_path, "label": label}
+
+
+def _preview_pdf(target: str) -> bytes | None:
+    libreoffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not libreoffice:
+        return None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        command = [
+            libreoffice,
+            "--headless",
+            "--nologo",
+            "--nofirststartwizard",
+            "--nodefault",
+            "--nolockcheck",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            tmpdir,
+            target,
+        ]
+        subprocess.run(command, check=True, capture_output=True, timeout=60)
+        pdf_path = os.path.join(tmpdir, f"{os.path.splitext(os.path.basename(target))[0]}.pdf")
+        if not os.path.isfile(pdf_path):
+            matches = [name for name in os.listdir(tmpdir) if name.lower().endswith(".pdf")]
+            if not matches:
+                return None
+            pdf_path = os.path.join(tmpdir, sorted(matches)[0])
+
+        with open(pdf_path, "rb") as f:
+            return f.read()
 
 
 app = FastAPI(
@@ -449,7 +487,6 @@ if OPEN_TERMINAL_INFO:
 # Files
 # ---------------------------------------------------------------------------
 
-
 @app.get(
     "/files/cwd",
     include_in_schema=False,
@@ -510,7 +547,7 @@ async def list_files(
     if not await fs.isdir(target):
         raise HTTPException(status_code=404, detail="Directory not found")
     entries = await fs.listdir(target)
-    return {"dir": target, "entries": entries}
+    return {"dir": target, "writable": await fs.is_writable(target), "entries": entries}
 
 
 @app.get(
@@ -624,6 +661,7 @@ async def display_file(
 )
 async def view_file(
     path: str = Query(..., description="Path to the file to view."),
+    preview: bool = Query(False, description="Return a best-effort rendered preview when available."),
     fs: UserFS = Depends(get_filesystem),
 ):
     """Return raw file bytes with the appropriate Content-Type.
@@ -634,6 +672,18 @@ async def view_file(
     target = fs.resolve_path(path)
     if not await fs.isfile(target):
         raise HTTPException(status_code=404, detail="File not found")
+
+    if preview:
+        ext = os.path.splitext(target)[1].lower()
+        if ext in (".docx", ".pptx"):
+            try:
+                pdf = await asyncio.to_thread(_preview_pdf, target)
+            except Exception:
+                log.exception("Rendered preview failed for %s", target)
+                pdf = None
+
+            if pdf:
+                return Response(content=pdf, media_type="application/pdf")
 
     import mimetypes
 
@@ -650,7 +700,7 @@ async def view_file(
 )
 async def serve_file(path: str, fs: UserFS = Depends(get_filesystem)):
     """Path-based alias for view_file — enables relative URL resolution in iframes."""
-    return await view_file(path=f"/{path}", fs=fs)
+    return await view_file(path=f"/{path}", preview=False, fs=fs)
 
 
 @app.post(
@@ -906,6 +956,368 @@ async def grep_search(
         "matches": matches,
         "truncated": truncated,
     }
+
+
+@app.get(
+    "/files/matches",
+    operation_id="match_files",
+    summary="Search files by name and contents",
+    description="Search files and directories by ranked name, path, and content matches.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        400: {"description": "Blank query."},
+        404: {"description": "Search directory not found."},
+        401: {"description": "Invalid or missing API key."},
+    },
+)
+async def match_files(
+    http_request: Request,
+    query: str = Query(..., description="Literal text to match."),
+    path: str = Query(".", description="Directory to search within."),
+    show_hidden: bool = Query(False, description="Include hidden dotfiles and dot-directories."),
+    offset: int = Query(0, description="Result offset.", ge=0),
+    limit: int = Query(
+        MATCH_PAGE_SIZE,
+        description="Maximum number of results to return.",
+        ge=1,
+        le=MATCH_PAGE_SIZE,
+    ),
+    fs: UserFS = Depends(get_filesystem),
+):
+    query = query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query must not be blank")
+
+    session_id = http_request.headers.get("x-session-id")
+    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    target = fs.resolve_path(path, cwd=session_cwd)
+    if not fs.is_path_allowed(target) or not await aiofiles.os.path.isdir(target):
+        raise HTTPException(status_code=404, detail="Search directory not found")
+
+    def _matches_sync():
+        query_lower = query.lower()
+
+        def is_hidden_path(candidate: str) -> bool:
+            return any(part.startswith(".") for part in candidate.replace("\\", "/").split("/") if part)
+
+        def content_match(text: str, line: int) -> dict | None:
+            text = text.rstrip("\r\n")
+            index = text.lower().find(query_lower)
+            if index < 0:
+                return None
+            column = len(text[:index].encode("utf-16-le")) // 2 + 1
+            return {"line": line, "column": column, "text": text}
+
+        def walk_entries() -> list[tuple[str, str]]:
+            try:
+                git_result = subprocess.run(
+                    ["git", "-C", target, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
+                    check=False,
+                    capture_output=True,
+                )
+            except OSError:
+                git_result = None
+
+            if git_result and git_result.returncode == 0:
+                git_entries = []
+                seen = set()
+                for raw in git_result.stdout.split(b"\0"):
+                    if not raw:
+                        continue
+                    rel_path = os.fsdecode(raw)
+                    if not show_hidden and is_hidden_path(rel_path):
+                        continue
+                    full_path = os.path.normpath(os.path.join(target, rel_path))
+                    if not fs.is_path_allowed(full_path):
+                        continue
+                    parent_rel = os.path.dirname(rel_path)
+                    while parent_rel and parent_rel != ".":
+                        if show_hidden or not is_hidden_path(parent_rel):
+                            directory = os.path.normpath(os.path.join(target, parent_rel))
+                            if directory not in seen and fs.is_path_allowed(directory):
+                                seen.add(directory)
+                                git_entries.append((directory, "directory"))
+                        parent_rel = os.path.dirname(parent_rel)
+                    if full_path not in seen:
+                        seen.add(full_path)
+                        git_entries.append((full_path, "directory" if os.path.isdir(full_path) else "file"))
+                return sorted(git_entries, key=lambda item: os.path.relpath(item[0], target).lower())
+
+            entries = []
+            for dirpath, dirnames, filenames in os.walk(target):
+                dirnames[:] = [
+                    d
+                    for d in sorted(dirnames)
+                    if (show_hidden or not d.startswith("."))
+                    and fs.is_path_allowed(os.path.join(dirpath, d))
+                ]
+                for name in dirnames:
+                    entries.append((os.path.join(dirpath, name), "directory"))
+                for name in sorted(filenames):
+                    if show_hidden or not name.startswith("."):
+                        full_path = os.path.join(dirpath, name)
+                        if fs.is_path_allowed(full_path):
+                            entries.append((full_path, "file"))
+            return entries
+
+        def content_matches_with_rg(files: set[str]) -> dict[str, list[dict]] | None:
+            rg = shutil.which("rg")
+            if not rg:
+                return None
+            args = [
+                rg,
+                "--json",
+                "--no-messages",
+                "--fixed-strings",
+                "--ignore-case",
+                "--line-number",
+                "--column",
+                "--max-count",
+                str(MAX_CONTENT_MATCHES_PER_FILE + 1),
+            ]
+            if show_hidden:
+                args.append("--hidden")
+            args.extend(("--", query, target))
+            try:
+                completed = subprocess.run(args, capture_output=True, text=True, check=False)
+            except OSError:
+                return None
+            if completed.returncode not in (0, 1):
+                return None
+
+            matches: dict[str, list[dict]] = {}
+            for raw in completed.stdout.splitlines():
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if message.get("type") != "match":
+                    continue
+                data = message["data"]
+                path = os.path.normpath(data["path"]["text"])
+                if path not in files:
+                    continue
+                line_matches = matches.setdefault(path, [])
+                if len(line_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
+                    continue
+                match = content_match(data["lines"]["text"], data["line_number"])
+                if match:
+                    line_matches.append(match)
+            return matches
+
+        def content_matches_with_python(files: set[str]) -> dict[str, list[dict]]:
+            matches: dict[str, list[dict]] = {}
+            for file_path in files:
+                try:
+                    if os.path.getsize(file_path) > MAX_CONTENT_SEARCH_FILE_SIZE:
+                        continue
+                    with open(file_path, "rb") as source:
+                        if b"\0" in source.read(8192):
+                            continue
+                    with open(file_path, "r", encoding="utf-8", errors="replace") as source:
+                        lines = source.read().splitlines()
+                except OSError:
+                    continue
+
+                for number, text in enumerate(lines, start=1):
+                    match = content_match(text, number)
+                    if not match:
+                        continue
+                    file_matches = matches.setdefault(file_path, [])
+                    if len(file_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
+                        break
+                    file_matches.append(match)
+            return matches
+
+        entries = walk_entries()
+        files = {
+            os.path.normpath(entry_path)
+            for entry_path, entry_type in entries
+            if entry_type == "file" and not os.path.islink(entry_path)
+        }
+        content_matches = content_matches_with_rg(files)
+        if content_matches is None:
+            content_matches = content_matches_with_python(files)
+
+        matches = []
+        for entry_path, entry_type in entries:
+            rel_path = os.path.relpath(entry_path, target).replace("\\", "/")
+            name = os.path.basename(entry_path)
+            name_lower = name.lower()
+            rel_lower = rel_path.lower()
+            if name_lower == query_lower:
+                score = 0
+            elif name_lower.startswith(query_lower):
+                score = 1
+            elif query_lower in name_lower:
+                score = 2
+            elif query_lower in rel_lower:
+                score = 3
+            else:
+                score = 4
+
+            entry_content_matches = content_matches.get(os.path.normpath(entry_path), []) if entry_type == "file" else []
+            name_match = score < 4
+            if not name_match and not entry_content_matches:
+                continue
+            matches.append(
+                (
+                    score,
+                    len(rel_path),
+                    rel_lower,
+                    {
+                        "path": entry_path,
+                        "relative_path": rel_path,
+                        "name": name,
+                        "type": entry_type,
+                        "name_match": name_match,
+                        "content_matches": entry_content_matches,
+                    },
+                )
+            )
+
+        matches.sort(key=lambda item: (item[0], item[1], item[2]))
+        next_offset = offset + limit if offset + limit < len(matches) else None
+        return {
+            "results": [item[3] for item in matches[offset : offset + limit]],
+            "next_offset": next_offset,
+        }
+
+    return await asyncio.to_thread(_matches_sync)
+
+
+@app.get(
+    "/files/search",
+    operation_id="search_files",
+    summary="Search files by name",
+    description="Search for files and subdirectories by ranked filename match.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        404: {"description": "Search directory not found."},
+        401: {"description": "Invalid or missing API key."},
+    },
+)
+async def search_files(
+    http_request: Request,
+    query: str = Query("", description="Filename search term."),
+    path: str = Query(".", description="Directory to search within."),
+    limit: int = Query(20, description="Maximum number of matches to return.", ge=1, le=100),
+    type: Optional[str] = Query(
+        "any",
+        description="Type filter: 'file', 'directory', or 'any'.",
+        pattern="^(file|directory|any)$",
+    ),
+    show_hidden: bool = Query(False, description="Include hidden dotfiles and dot-directories."),
+    fs: UserFS = Depends(get_filesystem),
+):
+    session_id = http_request.headers.get("x-session-id")
+    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    target = fs.resolve_path(path, cwd=session_cwd)
+    if not fs.is_path_allowed(target) or not await aiofiles.os.path.isdir(target):
+        raise HTTPException(status_code=404, detail="Search directory not found")
+
+    def _search_sync():
+        query_lower = query.strip().lower()
+        candidates = []
+        seen = set()
+
+        try:
+            git_result = subprocess.run(
+                ["git", "-C", target, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
+                check=False,
+                capture_output=True,
+            )
+        except OSError:
+            git_result = None
+
+        if git_result and git_result.returncode == 0:
+            for raw in git_result.stdout.split(b"\0"):
+                if not raw:
+                    continue
+                rel_path = os.fsdecode(raw)
+                parts = rel_path.replace("\\", "/").split("/")
+                if not show_hidden and any(part.startswith(".") for part in parts):
+                    continue
+
+                full_path = os.path.normpath(os.path.join(target, rel_path))
+                if type in ("any", "file") and full_path not in seen:
+                    seen.add(full_path)
+                    candidates.append((full_path, "file"))
+
+                if type in ("any", "directory"):
+                    parent_rel = os.path.dirname(rel_path)
+                    while parent_rel and parent_rel != ".":
+                        if show_hidden or not any(
+                            part.startswith(".") for part in parent_rel.replace("\\", "/").split("/")
+                        ):
+                            directory = os.path.normpath(os.path.join(target, parent_rel))
+                            if directory not in seen:
+                                seen.add(directory)
+                                candidates.append((directory, "directory"))
+                        parent_rel = os.path.dirname(parent_rel)
+        else:
+            for dirpath, dirnames, filenames in os.walk(target):
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if (show_hidden or not d.startswith("."))
+                    and fs.is_path_allowed(os.path.join(dirpath, d))
+                ]
+
+                if type in ("any", "directory"):
+                    for name in dirnames:
+                        full_path = os.path.join(dirpath, name)
+                        if full_path not in seen:
+                            seen.add(full_path)
+                            candidates.append((full_path, "directory"))
+
+                if type in ("any", "file"):
+                    for name in filenames:
+                        if not show_hidden and name.startswith("."):
+                            continue
+                        full_path = os.path.join(dirpath, name)
+                        if full_path not in seen:
+                            seen.add(full_path)
+                            candidates.append((full_path, "file"))
+
+        matches = []
+        for full_path, entry_type in candidates:
+            if not fs.is_path_allowed(full_path):
+                continue
+
+            name = os.path.basename(full_path)
+            name_lower = name.lower()
+            if query_lower and query_lower in name_lower:
+                rank = 0 if name_lower == query_lower else 1 if name_lower.startswith(query_lower) else 2
+            elif not query_lower:
+                rank = 2
+            else:
+                continue
+
+            try:
+                file_stat = os.stat(full_path)
+            except OSError:
+                continue
+
+            matches.append(
+                (
+                    rank,
+                    len(name),
+                    os.path.relpath(full_path, target).lower(),
+                    {
+                        "path": full_path,
+                        "name": name,
+                        "type": entry_type,
+                        "size": file_stat.st_size,
+                        "modified": file_stat.st_mtime,
+                    },
+                )
+            )
+
+        matches.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [item[3] for item in matches[:limit]]
+
+    return {"results": await asyncio.to_thread(_search_sync)}
 
 
 @app.get(
@@ -1334,6 +1746,31 @@ async def kill_process(
 
 from open_terminal.utils.port import detect_listening_ports, get_descendant_pids
 
+
+async def _visible_ports(request: Request) -> list[dict]:
+    all_ports = await asyncio.to_thread(detect_listening_ports)
+
+    try:
+        fs = get_filesystem(request)
+    except Exception:
+        # User provisioning failed (e.g. useradd rejected in restricted
+        # container runtimes).  An unprovisioned user has no ports.
+        return []
+
+    if fs.username:
+        # Filter by user UID
+        import pwd
+        try:
+            user_uid = pwd.getpwnam(fs.username).pw_uid
+            return [p for p in all_ports if p.get("uid") == user_uid]
+        except KeyError:
+            return []
+
+    own_pid = os.getpid()
+    descendant_pids = await asyncio.to_thread(get_descendant_pids, own_pid)
+    return [p for p in all_ports if p.get("pid") in descendant_pids]
+
+
 @app.get(
     "/ports",
     include_in_schema=False,
@@ -1345,27 +1782,7 @@ async def list_ports(request: Request):
     In multi-user mode, only shows ports owned by the requesting user.
     In single-user mode, shows ports owned by descendant processes.
     """
-    all_ports = await asyncio.to_thread(detect_listening_ports)
-
-    try:
-        fs = get_filesystem(request)
-    except Exception:
-        # User provisioning failed (e.g. useradd rejected in restricted
-        # container runtimes).  An unprovisioned user has no ports.
-        return {"ports": []}
-
-    if fs.username:
-        # Filter by user UID
-        import pwd
-        try:
-            user_uid = pwd.getpwnam(fs.username).pw_uid
-            all_ports = [p for p in all_ports if p.get("uid") == user_uid]
-        except KeyError:
-            all_ports = []
-    else:
-        own_pid = os.getpid()
-        descendant_pids = await asyncio.to_thread(get_descendant_pids, own_pid)
-        all_ports = [p for p in all_ports if p.get("pid") in descendant_pids]
+    all_ports = await _visible_ports(request)
 
     # Strip uid from response (internal detail)
     for p in all_ports:
@@ -1399,6 +1816,9 @@ async def port_proxy(port: int, path: str, request: Request):
     """Reverse-proxy a request to localhost:{port}/{path}."""
     if port < 1 or port > 65535:
         raise HTTPException(status_code=422, detail="Port must be between 1 and 65535")
+
+    if not any(p.get("port") == port for p in await _visible_ports(request)):
+        raise HTTPException(status_code=404, detail="Port not found")
 
     target_url = f"http://localhost:{port}/{path}"
     if request.query_params:

@@ -30,7 +30,7 @@ That's it — you're up and running at `http://localhost:8000`.
 |---|---|---|---|---|
 | **Best for** | AI agent sandboxes | Production / hardened | Edge / CI / minimal footprint | OpenShift restricted SCC |
 | **Size** | ~4 GB | ~430 MB | ~230 MB | ~430 MB |
-| **Bundled tooling** | Node.js, gcc, ffmpeg, LaTeX, Docker CLI, data science libs | git, curl, jq | git, curl, jq | git, curl, jq |
+| **Bundled tooling** | Node.js, gcc, ffmpeg, LibreOffice, LaTeX, Docker CLI, data science libs | git, curl, jq | git, curl, jq | git, curl, jq |
 | **Install packages at runtime** | ✔ (has `sudo`) | ✘ | ✘ | ✘ |
 | **Multi-user mode** | ✔ | ✘ | ✘ | ✘ |
 | **Egress firewall** | ✔ | ✔ | ✔ | ✘ |
@@ -45,6 +45,9 @@ docker run -d -p 8000:8000 -e OPEN_TERMINAL_API_KEY=secret ghcr.io/open-webui/op
 
 > [!NOTE]
 > Slim and Alpine don't support `OPEN_TERMINAL_PACKAGES` / `OPEN_TERMINAL_PIP_PACKAGES` / `OPEN_TERMINAL_NPM_PACKAGES`. To add packages, extend [Dockerfile.slim](Dockerfile.slim) or [Dockerfile.alpine](Dockerfile.alpine).
+
+> [!NOTE]
+> The default `latest` image includes LibreOffice for Word, Excel, and PowerPoint to PDF conversions. The `slim`, `alpine`, and `openshift` images stay minimal; build a custom image if those variants need Office conversion tools.
 
 > [!NOTE]
 > The OpenShift image is for restricted non-root pod policies. It does not support runtime package installs, Docker socket access, the iptables egress firewall, or `OPEN_TERMINAL_MULTI_USER=true`. Build a custom image ahead of time when OpenShift users need extra tools.
@@ -163,6 +166,25 @@ Set `OPEN_TERMINAL_FILE_BROWSER_ROOT` to:
 | `filesystem` | Opt out and report no visual root metadata |
 
 This is a UI hint for clients. It does not restrict terminal commands or file APIs.
+
+### External Workspace Storage
+
+Open Terminal uses the filesystem it is mounted on. To store workspace files
+externally, mount that storage into the container:
+
+- Single-user: `/home/user`
+- Multi-user: `/home`
+
+This can be a Docker volume, Kubernetes persistent volume, NFS/Azure Files
+mount, or FUSE mount such as blobfuse, s3fs, or rclone.
+
+### Office Previews
+
+`GET /files/view?path=...` always returns the original file by default. Clients
+that want a rendered preview can add `preview=true`; when LibreOffice is
+available the server can return DOCX and PPTX previews as PDF. When rendered
+preview support is not available, the same endpoint falls back to returning the
+original file bytes.
 
 ## Using with Open WebUI
 

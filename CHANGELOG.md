@@ -4,6 +4,64 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.3] - 2026-08-27
+
+### Added
+
+- Word and PowerPoint files can now open as PDF previews from the file viewer when preview mode is requested. If a preview cannot be made, Open Terminal still returns the original file.
+- The default Docker image now includes the PDF tools needed for previews and PDF file work, so users do not have to install them separately.
+- The README now explains how to use external workspace storage and how Office file previews behave.
+
+## [0.12.2] - 2026-08-25
+
+### Fixed
+
+- Opening a forwarded port now only works for ports that belong to your own visible terminal session. Requests for other local ports are blocked with "Port not found" instead of being forwarded.
+
+## [0.12.1] - 2026-08-22
+
+### Fixed
+
+- Added headless LibreOffice and Office-compatible fonts to the default Docker image so agents can convert Word, Excel, and PowerPoint files to PDF without installing extra system packages. The slim, alpine, and openshift images remain minimal.
+
+## [0.12.0] - 2026-08-22
+
+### Added
+
+- Apps can now search terminal workspace files by file name and file contents in one file browser search.
+- Search results show file name matches first, followed by files that match inside their contents.
+- Content results include matching line previews so users can jump to the relevant place in a file.
+- File browser search follows the current terminal session folder, so users search the same workspace their terminal is using.
+- File browser search respects `.gitignore` and the app's hidden-file setting.
+- Large search result sets can now load more results without restarting the search.
+
+## [0.11.36] - 2026-08-22
+
+### Added
+
+- Added file search for apps that need to let users pick files from the active terminal workspace.
+- File search now follows the current terminal session folder, so results come from the same place the terminal is working in.
+- File search respects `.gitignore`, so ignored folders and files do not appear in picker results.
+- File search can include hidden dotfiles when the connected app asks to show them.
+
+### Fixed
+
+- Every file search result now includes the file name, full path, whether it is a file or folder, file size, and last modified time.
+
+## [0.11.35] - 2026-08-09
+
+### Added
+
+- Added an OpenShift image for restricted non-root clusters. It runs without root, blocks unsupported runtime package installs, and clearly reports when multi-user mode is requested.
+- Added file browser root metadata so clients can show a friendly starting point and hide parent navigation above it.
+- Added `OPEN_TERMINAL_FILE_BROWSER_ROOT` so operators can choose Home, a specific workspace path, a path under Home, or no visual root.
+- Added writable status to file and folder listings so clients can disable save, upload, rename, and delete actions before users hit a permission error.
+- Added template variables for custom system prompts, including operating system, host name, user, shell, Python version, and Home path.
+
+### Fixed
+
+- Fixed the MCP server connection when Open Terminal is protected by an API key. MCP requests now include the configured bearer token.
+
 ## [0.11.34] - 2026-04-08
 
 ### Added
