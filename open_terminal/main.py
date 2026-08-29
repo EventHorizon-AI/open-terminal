@@ -6,18 +6,15 @@ import json
 import logging
 import tempfile
 
-import aiofiles
 import aiofiles.os
 import os
 import platform
 import re
-import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -27,8 +24,8 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
-from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner
+from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
+from open_terminal.utils.runner import ProcessRunner
 from open_terminal.utils.fs import UserFS
 
 MATCH_PAGE_SIZE = 100
@@ -117,13 +114,6 @@ def get_system_prompt() -> str:
 
     return prompt
 
-
-_EXECUTE_DESCRIPTION = (
-    "Run a shell command in the background and return a command ID.\n\n"
-    + get_system_info()
-)
-if EXECUTE_DESCRIPTION:
-    _EXECUTE_DESCRIPTION += "\n\n" + EXECUTE_DESCRIPTION
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -239,65 +229,6 @@ async def normalize_null_query_params(request: Request, call_next):
 # ---------------------------------------------------------------------------
 
 
-class ExecRequest(BaseModel):
-    command: str = Field(
-        ...,
-        description="Shell command to execute. Supports chaining (&&, ||, ;), pipes (|), and redirections.",
-        json_schema_extra={"examples": ["echo hello", "ls -la && whoami"]},
-    )
-    cwd: Optional[str] = Field(
-        None,
-        description="Working directory for the command. Defaults to the server's current directory if not set.",
-    )
-    env: Optional[dict[str, str]] = Field(
-        None,
-        description="Extra environment variables merged into the subprocess environment.",
-    )
-
-
-class InputRequest(BaseModel):
-    input: str = Field(
-        ...,
-        description="Text to send to the process's stdin. Include newline characters as needed.",
-    )
-
-
-class WriteRequest(BaseModel):
-    path: str = Field(
-        ...,
-        description="Absolute or relative path to write to. Parent directories are created automatically.",
-    )
-    content: str = Field(
-        ...,
-        description="Text content to write to the file.",
-    )
-
-
-class ReplacementChunk(BaseModel):
-    target: str = Field(
-        ...,
-        description="Exact string to find. Must match precisely, including whitespace.",
-    )
-    replacement: str = Field(
-        ...,
-        description="Content to replace the target with.",
-    )
-    start_line: Optional[int] = Field(
-        None,
-        description="Narrow the search to lines at or after this (1-indexed).",
-        ge=1,
-    )
-    end_line: Optional[int] = Field(
-        None,
-        description="Narrow the search to lines at or before this (1-indexed).",
-        ge=1,
-    )
-    allow_multiple: bool = Field(
-        False,
-        description="If true, replaces all occurrences. If false, errors when multiple matches are found.",
-    )
-
-
 class MkdirRequest(BaseModel):
     path: str = Field(
         ...,
@@ -313,17 +244,6 @@ class MoveRequest(BaseModel):
     destination: str = Field(
         ...,
         description="Destination path (new location).",
-    )
-
-
-class ReplaceRequest(BaseModel):
-    path: str = Field(
-        ...,
-        description="Path to the file to modify.",
-    )
-    replacements: list[ReplacementChunk] = Field(
-        ...,
-        description="List of find-and-replace operations to apply sequentially.",
     )
 
 
@@ -704,27 +624,6 @@ async def serve_file(path: str, fs: UserFS = Depends(get_filesystem)):
 
 
 @app.post(
-    "/files/write",
-    operation_id="write_file",
-    summary="Write a file",
-    description="Write text content to a file. Creates parent directories automatically. Overwrites if the file already exists.",
-    dependencies=[Depends(verify_api_key)],
-    responses={
-        401: {"description": "Invalid or missing API key."},
-    },
-)
-async def write_file(http_request: Request, request: WriteRequest, fs: UserFS = Depends(get_filesystem)):
-    session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
-    target = fs.resolve_path(request.path, cwd=session_cwd)
-    try:
-        await fs.write(target, request.content)
-    except (OSError, subprocess.CalledProcessError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"path": target, "size": len(request.content.encode())}
-
-
-@app.post(
     "/files/mkdir",
     include_in_schema=False,
     dependencies=[Depends(verify_api_key)],
@@ -782,66 +681,6 @@ async def move_entry(request: MoveRequest, fs: UserFS = Depends(get_filesystem))
     except (OSError, subprocess.CalledProcessError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"source": source, "destination": destination}
-
-
-@app.post(
-    "/files/replace",
-    operation_id="replace_file_content",
-    summary="Replace content in a file",
-    description="Find and replace exact strings in a file. Supports multiple replacements in one call with optional line range narrowing.",
-    dependencies=[Depends(verify_api_key)],
-    responses={
-        404: {"description": "File not found."},
-        400: {"description": "Target string not found or ambiguous match."},
-        401: {"description": "Invalid or missing API key."},
-    },
-)
-async def replace_file_content(http_request: Request, request: ReplaceRequest, fs: UserFS = Depends(get_filesystem)):
-    session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
-    target = fs.resolve_path(request.path, cwd=session_cwd)
-    if not await fs.isfile(target):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    try:
-        content = await fs.read_text(target)
-    except OSError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    for chunk in request.replacements:
-        if chunk.start_line or chunk.end_line:
-            lines = content.splitlines(keepends=True)
-            start = (chunk.start_line or 1) - 1
-            end = chunk.end_line or len(lines)
-            search_region = "".join(lines[start:end])
-        else:
-            search_region = content
-
-        count = search_region.count(chunk.target)
-        if count == 0:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Target string not found: {chunk.target[:100]!r}",
-            )
-        if count > 1 and not chunk.allow_multiple:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Found {count} occurrences of target string but allow_multiple is false",
-            )
-
-        if chunk.start_line or chunk.end_line:
-            new_region = search_region.replace(chunk.target, chunk.replacement)
-            lines[start:end] = [new_region]
-            content = "".join(lines)
-        else:
-            content = content.replace(chunk.target, chunk.replacement)
-
-    try:
-        await fs.write(target, content)
-    except OSError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    return {"path": target, "size": len(content.encode())}
 
 
 @app.get(
@@ -1556,75 +1395,6 @@ async def list_processes():
     ]
 
 
-@app.post(
-    "/execute",
-    operation_id="run_command",
-    summary="Execute a command",
-    description=_EXECUTE_DESCRIPTION,
-    dependencies=[Depends(verify_api_key)],
-    responses={
-        401: {"description": "Invalid or missing API key."},
-    },
-)
-async def execute(
-    http_request: Request,
-    request: ExecRequest,
-    wait: Optional[float] = Query(
-        None,
-        description="Seconds to wait for the command to finish before returning. If the command completes in time, output is included inline. Null to return immediately.",
-        ge=0,
-        le=300,
-    ),
-    tail: Optional[int] = Query(
-        None,
-        description="Return only the last N output entries. Useful to limit response size when only recent output matters.",
-        ge=1,
-    ),
-):
-    fs = get_filesystem(http_request)
-    session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
-    cwd = fs.resolve_path(request.cwd, cwd=session_cwd) if request.cwd else (session_cwd or fs.home)
-
-    subprocess_env = {**os.environ, **request.env} if request.env else None
-    runner = await create_runner(
-        request.command, cwd, subprocess_env, run_as_user=fs.username
-    )
-
-    process_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
-    log_path = os.path.join(LOG_DIR, "processes", f"{process_id}.jsonl")
-    background_process = BackgroundProcess(
-        id=process_id, command=request.command, runner=runner, log_path=log_path
-    )
-    background_process.log_task = asyncio.create_task(log_process(background_process))
-    _processes[process_id] = background_process
-
-    if wait is None and EXECUTE_TIMEOUT:
-        wait = EXECUTE_TIMEOUT
-    if wait is not None:
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(background_process.log_task), timeout=wait
-            )
-        except asyncio.TimeoutError:
-            pass
-
-    output, next_offset, truncated = await read_log(
-        background_process.log_path, offset=0, tail=tail
-    )
-
-    return {
-        "id": process_id,
-        "command": request.command,
-        "status": background_process.status,
-        "exit_code": background_process.exit_code,
-        "output": output,
-        "truncated": truncated,
-        "next_offset": next_offset,
-        "log_path": background_process.log_path,
-    }
-
-
 @app.get(
     "/execute/{process_id}/status",
     operation_id="get_process_status",
@@ -1681,63 +1451,6 @@ async def get_status(
         "next_offset": next_offset,
         "log_path": background_process.log_path,
     }
-
-
-@app.post(
-    "/execute/{process_id}/input",
-    operation_id="send_process_input",
-    summary="Send input to a running command",
-    description="Write text to the process's stdin. Include newline characters as needed.",
-    dependencies=[Depends(verify_api_key)],
-    responses={
-        404: {"description": "Process not found."},
-        400: {"description": "Process has already exited or stdin is closed."},
-        401: {"description": "Invalid or missing API key."},
-    },
-)
-async def send_input(process_id: str, body: InputRequest):
-    background_process = _get_process(process_id)
-    if background_process.status != "running":
-        raise HTTPException(status_code=400, detail="Process has already exited")
-
-    # Convert literal escape sequences (\n, \x03 for Ctrl-C, etc.) into real
-    # characters — LLMs often emit these as literal strings.
-    text = body.input.encode("raw_unicode_escape").decode("unicode_escape")
-
-    try:
-        background_process.runner.write_input(text.encode())
-        if isinstance(background_process.runner, PipeRunner):
-            await background_process.runner.drain_input()
-    except (BrokenPipeError, ConnectionResetError, OSError):
-        raise HTTPException(status_code=400, detail="Process stdin is closed")
-
-    return {"status": "ok"}
-
-
-@app.delete(
-    "/execute/{process_id}",
-    operation_id="kill_process",
-    summary="Kill a running command",
-    description="Terminate the process. Sends SIGTERM by default for graceful shutdown. Use force=true to send SIGKILL.",
-    dependencies=[Depends(verify_api_key)],
-    responses={
-        404: {"description": "Process not found."},
-        401: {"description": "Invalid or missing API key."},
-    },
-)
-async def kill_process(
-    process_id: str,
-    force: bool = Query(False, description="Send SIGKILL instead of SIGTERM."),
-):
-    background_process = _get_process(process_id)
-    if background_process.status == "running":
-        background_process.runner.kill(force=force)
-        exit_code = await background_process.runner.wait()
-        background_process.runner.close()
-        background_process.status = "killed"
-        background_process.exit_code = exit_code
-    del _processes[process_id]
-    return {"status": "killed"}
 
 
 # ---------------------------------------------------------------------------
